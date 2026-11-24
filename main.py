@@ -1,4 +1,5 @@
 import os
+from fastapi.middleware.cors import CORSMiddleware
 import time
 from typing import Optional
 
@@ -23,9 +24,19 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY or not TOKEN_SECRET:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 app = FastAPI(title="Expense Tracker API")
 
+raw_origins = os.getenv(
+    "ALLOWED_ORIGINS",
+    "https://nagendrakumarm.github.io,http://localhost:5500",
+)
+allowed_origins = [
+    origin.strip().rstrip("/")
+    for origin in raw_origins.split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -211,3 +222,71 @@ def summarize_month(rows: list[dict], year_month: str = "") -> dict:
     }
 
 
+class TransactionUpdate(BaseModel):
+    date: Optional[str] = None
+    store: Optional[str] = None
+    description: Optional[str] = None
+    amount: Optional[float] = None
+    category: Optional[int] = None
+
+
+@app.patch("/api/transactions/{tx_id}")
+def patch_transaction(
+    tx_id: int,
+    payload: TransactionUpdate,
+    _user: str = Depends(verify_bearer_token),
+):
+    updates: dict = {}
+
+    if payload.date is not None:
+        clean_date = payload.date.strip()
+        if not clean_date:
+            raise HTTPException(status_code=400, detail="date cannot be empty")
+        updates["date"] = clean_date
+
+    if payload.store is not None:
+        clean_store = payload.store.strip()
+        if not clean_store:
+            raise HTTPException(status_code=400, detail="store cannot be empty")
+        updates["store"] = clean_store
+
+    if payload.description is not None:
+        clean_desc = payload.description.strip()
+        updates["description"] = clean_desc if clean_desc else None
+
+    if payload.amount is not None:
+        updates["amount"] = abs(float(payload.amount))
+
+    if payload.category is not None:
+        updates["category"] = int(payload.category)
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields provided to update")
+
+    res = (
+        supabase.table("Transactions")
+        .update(updates)
+        .eq("id", tx_id)
+        .execute()
+    )
+    updated = (res.data or [None])[0]
+    if not updated:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return {"transaction": updated}
+
+
+@app.delete("/api/transactions/{tx_id}")
+def delete_transaction(
+    tx_id: int,
+    _user: str = Depends(verify_bearer_token),
+):
+    res = (
+        supabase.table("Transactions")
+        .delete()
+        .eq("id", tx_id)
+        .execute()
+    )
+    deleted = (res.data or [None])[0]
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return {"deleted": True, "id": tx_id}
