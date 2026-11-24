@@ -2,6 +2,8 @@ import os
 from fastapi.middleware.cors import CORSMiddleware
 import time
 from typing import Optional
+from datetime import date
+from fastapi import Query
 
 import jwt
 from dotenv import load_dotenv
@@ -290,3 +292,87 @@ def delete_transaction(
     if not deleted:
         raise HTTPException(status_code=404, detail="Transaction not found")
     return {"deleted": True, "id": tx_id}
+
+def _trailing_year_months(anchor_month: str, count: int) -> list[str]:
+    parts = anchor_month.strip().split("-")
+    if len(parts) != 2:
+        raise HTTPException(status_code=400, detail="anchor_month must be YYYY-MM")
+    try:
+        yr, mo = int(parts[0]), int(parts[1])
+        if not (1 <= mo <= 12):
+            raise ValueError()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid anchor_month")
+
+    result: list[str] = []
+    for offset in range(count - 1, -1, -1):
+        month_index = (yr * 12 + (mo - 1)) - offset
+        target_yr, target_mo0 = divmod(month_index, 12)
+        result.append(f"{target_yr:04d}-{target_mo0 + 1:02d}")
+    return result
+
+
+@app.get("/api/comparison")
+def get_category_comparison(
+    anchor_month: str = Query(default="2026-11"),
+    months: int = Query(default=3, ge=1, le=24),
+    _user: str = Depends(verify_bearer_token),
+):
+    ym_list = _trailing_year_months(anchor_month, months)
+    month_set = set(ym_list)
+    start_date = f"{ym_list[0]}-01"
+
+    first_yr, first_mo = map(int, ym_list[-1].split("-"))
+    if first_mo == 12:
+        end_date = f"{first_yr + 1:04d}-01-01"
+    else:
+        end_date = f"{first_yr:04d}-{first_mo + 1:02d}-01"
+
+    cats_res = supabase.table("Categories").select("*").execute()
+    categories_rows = cats_res.data or []
+
+    cat_subtype_by_id: dict[int, str] = {}
+    cat_type_by_id: dict[int, str] = {}
+    for c in categories_rows:
+        cid = int(c["id"])
+        cat_subtype_by_id[cid] = str(c.get("subtype") or "Uncategorized").strip()
+        cat_type_by_id[cid] = str(c.get("categoryType") or c.get("type") or "Expense").strip()
+
+    tx_res = (
+        supabase.table("Transactions")
+        .select("*")
+        .gte("date", start_date)
+        .lt("date", end_date)
+        .execute()
+    )
+    tx_rows = tx_res.data or []
+
+    totals_by_month: dict[str, dict[str, float]] = {ym: {} for ym in ym_list}
+    expense_categories: set[str] = set()
+
+    for row in tx_rows:
+        ym = str(row.get("date") or "")[:7]
+        if ym not in month_set:
+            continue
+
+        cid = int(row.get("category") or 0)
+        cat_type = str(row.get("categoryType") or cat_type_by_id.get(cid) or "Expense").lower()
+        if "income" in cat_type:
+            continue
+
+        subtype = str(row.get("subtype") or cat_subtype_by_id.get(cid) or "Uncategorized").strip()
+        amount = abs(float(row.get("amount") or 0.0))
+
+        expense_categories.add(subtype)
+        totals_by_month[ym][subtype] = round(totals_by_month[ym].get(subtype, 0.0) + amount, 2)
+
+    sorted_categories = sorted(expense_categories, key=str.lower)
+    for ym in ym_list:
+        for cat in sorted_categories:
+            totals_by_month[ym].setdefault(cat, 0.0)
+
+    return {
+        "months": ym_list,
+        "categories": sorted_categories,
+        "totals_by_month": totals_by_month,
+    }
