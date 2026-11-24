@@ -83,7 +83,7 @@ class TransactionUpdate(BaseModel):
 
 class PaymentCreateItem(BaseModel):
     account_id: int
-    amount: float = Field(..., gt=0)
+    amount: float = Field(..., ge=0)
     month: str = Field(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
     is_paid: bool = False
 
@@ -95,7 +95,7 @@ class PaymentBatchCreate(BaseModel):
 class PaymentPatch(BaseModel):
     is_paid: Optional[bool] = None
     paid: Optional[bool] = None
-    amount: Optional[float] = Field(default=None, gt=0)
+    amount: Optional[float] = Field(default=None, ge=0)
     month: Optional[str] = Field(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
     account_id: Optional[int] = None
 
@@ -460,18 +460,20 @@ def _serialize_payment_row(row: dict, account_by_id: dict[int, dict]) -> dict:
     acct = account_by_id.get(acct_id) if acct_id is not None else None
     account_name = acct["name"] if acct else (f"Account #{acct_id}" if acct_id is not None else "Unassigned Account")
     due_day = acct["duedate"] if acct else 15
-
+    clean_amount = float(row.get("amount") or 0.0)
+    is_paid = True if clean_amount <= 0 else bool(row.get("is_paid"))
+    
     return {
         "id": row["id"],
         "account_id": acct_id,
         "account_name": account_name,
         "title": account_name,
-        "amount": float(row.get("amount") or 0.0),
+        "amount": clean_amount,
         "due_day": due_day,
         "month": str(row.get("month") or "").strip(),
         "year_month": str(row.get("month") or "").strip(),
-        "is_paid": bool(row.get("is_paid")),
-        "paid": bool(row.get("is_paid")),
+        "is_paid": is_paid,
+        "paid": is_paid,
     }
 
 
@@ -504,12 +506,13 @@ def create_payments(
         if acct_id not in account_by_id:
             raise HTTPException(status_code=404, detail=f"Account {acct_id} not found")
 
+        clean_amount = round(abs(float(item.amount)), 2)
         records_to_insert.append(
             {
                 "account_id": acct_id,
-                "amount": round(abs(float(item.amount)), 2),
+                "amount": clean_amount,
                 "month": validate_year_month(item.month),
-                "is_paid": bool(item.is_paid),
+                "is_paid": True if clean_amount ==0 else bool(item.is_paid),
             }
         )
 
@@ -538,7 +541,10 @@ def patch_payment(
     if paid_val is not None:
         updates["is_paid"] = bool(paid_val)
     if payload.amount is not None:
-        updates["amount"] = round(abs(float(payload.amount)), 2)
+        clean_amount = round(abs(float(payload.amount)), 2)
+        updates["amount"] = clean_amount
+        if clean_amount == 0:
+            updates["is_paid"] = True
     if payload.month is not None:
         updates["month"] = validate_year_month(payload.month)
     if payload.account_id is not None:
