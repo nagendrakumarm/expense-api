@@ -1,15 +1,14 @@
 import os
-from fastapi.middleware.cors import CORSMiddleware
+import re
 import time
-from typing import Optional
 from datetime import date
-from fastapi import Query
+from typing import Optional
 
 import jwt
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from supabase import Client, create_client
 
 load_dotenv()
@@ -44,6 +43,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+YEAR_MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+
+def current_year_month() -> str:
+    return date.today().strftime("%Y-%m")
+
+
+def validate_year_month(ym: str) -> str:
+    cleaned = ym.strip()
+    if not YEAR_MONTH_RE.match(cleaned):
+        raise HTTPException(status_code=400, detail="Month must be in YYYY-MM format")
+    return cleaned
+
+
+# --- Models ---
+
 
 class LoginRequest(BaseModel):
     username: str
@@ -56,6 +71,36 @@ class TransactionCreate(BaseModel):
     description: Optional[str] = None
     amount: float
     category: int
+
+
+class TransactionUpdate(BaseModel):
+    date: Optional[str] = None
+    store: Optional[str] = None
+    description: Optional[str] = None
+    amount: Optional[float] = None
+    category: Optional[int] = None
+
+
+class PaymentCreateItem(BaseModel):
+    account_id: int
+    amount: float = Field(..., gt=0)
+    month: str = Field(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+    is_paid: bool = False
+
+
+class PaymentBatchCreate(BaseModel):
+    payments: list[PaymentCreateItem] = Field(..., min_length=1)
+
+
+class PaymentPatch(BaseModel):
+    is_paid: Optional[bool] = None
+    paid: Optional[bool] = None
+    amount: Optional[float] = Field(default=None, gt=0)
+    month: Optional[str] = Field(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+    account_id: Optional[int] = None
+
+
+# --- Auth ---
 
 
 def create_access_token(username: str, expires_in_days: int = 30) -> str:
@@ -89,6 +134,9 @@ def login(creds: LoginRequest):
     return {"access_token": token, "token_type": "bearer"}
 
 
+# --- Categories & Summary ---
+
+
 @app.get("/api/categories")
 def get_categories(_user: str = Depends(verify_bearer_token)):
     types_res = supabase.table("CategoryType").select("id, type").execute()
@@ -103,9 +151,11 @@ def get_categories(_user: str = Depends(verify_bearer_token)):
         {
             "id": row["id"],
             "typeId": row["type"],
-            "categoryType": type_map.get(int(row["type"]), "Expense")
-            if row.get("type") is not None
-            else "Expense",
+            "categoryType": (
+                type_map.get(int(row["type"]), "Expense")
+                if row.get("type") is not None
+                else "Expense"
+            ),
             "subtype": (row.get("subtype") or "").strip(),
         }
         for row in (cats_res.data or [])
@@ -118,37 +168,9 @@ def get_summary(
     month: str = Query(default=""),
     _user: str = Depends(verify_bearer_token),
 ):
+    target_month = validate_year_month(month) if month.strip() else current_year_month()
     rows = fetch_enriched_transactions()
-    return summarize_month(rows, month.strip())
-
-
-@app.post("/api/transactions", status_code=201)
-def create_transaction(
-    payload: TransactionCreate,
-    _user: str = Depends(verify_bearer_token),
-):
-    clean_store = payload.store.strip()
-    clean_description = payload.description.strip() if payload.description else None
-    if not payload.date.strip() or not clean_store:
-        raise HTTPException(status_code=400, detail="date and store are required")
-
-    insert_res = (
-        supabase.table("Transactions")
-        .insert(
-            {
-                "date": payload.date.strip(),
-                "store": clean_store,
-                "description": clean_description,
-                "amount": float(payload.amount),
-                "category": int(payload.category),
-            }
-        )
-        .execute()
-    )
-    created = (insert_res.data or [None])[0]
-    if not created:
-        raise HTTPException(status_code=500, detail="Insert succeeded without returned row")
-    return {"transaction": created}
+    return summarize_month(rows, target_month)
 
 
 def fetch_enriched_transactions() -> list[dict]:
@@ -165,9 +187,11 @@ def fetch_enriched_transactions() -> list[dict]:
     cat_map = {
         int(row["id"]): {
             "subtype": (row.get("subtype") or "Uncategorized").strip(),
-            "categoryType": type_map.get(int(row["type"]), "Expense")
-            if row.get("type") is not None
-            else "Expense",
+            "categoryType": (
+                type_map.get(int(row["type"]), "Expense")
+                if row.get("type") is not None
+                else "Expense"
+            ),
         }
         for row in (cats_res.data or [])
     }
@@ -224,12 +248,36 @@ def summarize_month(rows: list[dict], year_month: str = "") -> dict:
     }
 
 
-class TransactionUpdate(BaseModel):
-    date: Optional[str] = None
-    store: Optional[str] = None
-    description: Optional[str] = None
-    amount: Optional[float] = None
-    category: Optional[int] = None
+# --- Transactions ---
+
+
+@app.post("/api/transactions", status_code=201)
+def create_transaction(
+    payload: TransactionCreate,
+    _user: str = Depends(verify_bearer_token),
+):
+    clean_store = payload.store.strip()
+    clean_description = payload.description.strip() if payload.description else None
+    if not payload.date.strip() or not clean_store:
+        raise HTTPException(status_code=400, detail="date and store are required")
+
+    insert_res = (
+        supabase.table("Transactions")
+        .insert(
+            {
+                "date": payload.date.strip(),
+                "store": clean_store,
+                "description": clean_description,
+                "amount": float(payload.amount),
+                "category": int(payload.category),
+            }
+        )
+        .execute()
+    )
+    created = (insert_res.data or [None])[0]
+    if not created:
+        raise HTTPException(status_code=500, detail="Insert succeeded without returned row")
+    return {"transaction": created}
 
 
 @app.patch("/api/transactions/{tx_id}")
@@ -293,16 +341,13 @@ def delete_transaction(
         raise HTTPException(status_code=404, detail="Transaction not found")
     return {"deleted": True, "id": tx_id}
 
+
+# --- Multi-Month Category Comparison ---
+
+
 def _trailing_year_months(anchor_month: str, count: int) -> list[str]:
-    parts = anchor_month.strip().split("-")
-    if len(parts) != 2:
-        raise HTTPException(status_code=400, detail="anchor_month must be YYYY-MM")
-    try:
-        yr, mo = int(parts[0]), int(parts[1])
-        if not (1 <= mo <= 12):
-            raise ValueError()
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid anchor_month")
+    cleaned = validate_year_month(anchor_month)
+    yr, mo = map(int, cleaned.split("-"))
 
     result: list[str] = []
     for offset in range(count - 1, -1, -1):
@@ -314,19 +359,20 @@ def _trailing_year_months(anchor_month: str, count: int) -> list[str]:
 
 @app.get("/api/comparison")
 def get_category_comparison(
-    anchor_month: str = Query(default="2026-11"),
+    anchor_month: str = Query(default=""),
     months: int = Query(default=3, ge=1, le=24),
     _user: str = Depends(verify_bearer_token),
 ):
-    ym_list = _trailing_year_months(anchor_month, months)
+    anchor = anchor_month.strip() or current_year_month()
+    ym_list = _trailing_year_months(anchor, months)
     month_set = set(ym_list)
     start_date = f"{ym_list[0]}-01"
 
-    first_yr, first_mo = map(int, ym_list[-1].split("-"))
-    if first_mo == 12:
-        end_date = f"{first_yr + 1:04d}-01-01"
+    last_yr, last_mo = map(int, ym_list[-1].split("-"))
+    if last_mo == 12:
+        end_date = f"{last_yr + 1:04d}-01-01"
     else:
-        end_date = f"{first_yr:04d}-{first_mo + 1:02d}-01"
+        end_date = f"{last_yr:04d}-{last_mo + 1:02d}-01"
 
     cats_res = supabase.table("Categories").select("*").execute()
     categories_rows = cats_res.data or []
@@ -376,3 +422,159 @@ def get_category_comparison(
         "categories": sorted_categories,
         "totals_by_month": totals_by_month,
     }
+
+
+# --- Accounts & Monthly Payments ---
+
+
+def _fetch_accounts() -> tuple[list[dict], dict[int, dict]]:
+    res = (
+        supabase.table("Accounts")
+        .select("id, name, type, duedate, isactive")
+        .order("id", desc=False)
+        .execute()
+    )
+    rows = res.data or []
+    accounts: list[dict] = []
+    by_id: dict[int, dict] = {}
+
+    for row in rows:
+        is_active = row.get("isactive")
+        if is_active is False:
+            continue
+        acct = {
+            "id": int(row["id"]),
+            "name": str(row.get("name") or "").strip(),
+            "type": int(row["type"]) if row.get("type") is not None else None,
+            "duedate": int(row["duedate"]) if row.get("duedate") is not None else 15,
+            "isactive": True if is_active is None else bool(is_active),
+        }
+        accounts.append(acct)
+        by_id[acct["id"]] = acct
+
+    return accounts, by_id
+
+
+def _serialize_payment_row(row: dict, account_by_id: dict[int, dict]) -> dict:
+    acct_id = int(row["account_id"]) if row.get("account_id") is not None else None
+    acct = account_by_id.get(acct_id) if acct_id is not None else None
+    account_name = acct["name"] if acct else (f"Account #{acct_id}" if acct_id is not None else "Unassigned Account")
+    due_day = acct["duedate"] if acct else 15
+
+    return {
+        "id": row["id"],
+        "account_id": acct_id,
+        "account_name": account_name,
+        "title": account_name,
+        "amount": float(row.get("amount") or 0.0),
+        "due_day": due_day,
+        "month": str(row.get("month") or "").strip(),
+        "year_month": str(row.get("month") or "").strip(),
+        "is_paid": bool(row.get("is_paid")),
+        "paid": bool(row.get("is_paid")),
+    }
+
+
+@app.get("/api/payments")
+def get_payments(
+    month: str = Query(default=""),
+    scope: str = Query(default="all"),
+    _user: str = Depends(verify_bearer_token),
+):
+    accounts, account_by_id = _fetch_accounts()
+    query = supabase.table("monthly_payments").select("*")
+    if scope == "month" and month.strip():
+        target_month = validate_year_month(month)
+        query = query.eq("month", target_month)
+    res = query.order("month", desc=False).order("id", desc=False).execute()
+    payments = [_serialize_payment_row(r, account_by_id) for r in (res.data or [])]
+    return {"accounts": accounts, "payments": payments}
+
+
+@app.post("/api/payments", status_code=201)
+def create_payments(
+    payload: PaymentBatchCreate,
+    _user: str = Depends(verify_bearer_token),
+):
+    _, account_by_id = _fetch_accounts()
+    records_to_insert: list[dict] = []
+
+    for item in payload.payments:
+        acct_id = int(item.account_id)
+        if acct_id not in account_by_id:
+            raise HTTPException(status_code=404, detail=f"Account {acct_id} not found")
+
+        records_to_insert.append(
+            {
+                "account_id": acct_id,
+                "amount": round(abs(float(item.amount)), 2),
+                "month": validate_year_month(item.month),
+                "is_paid": bool(item.is_paid),
+            }
+        )
+
+    res = (
+        supabase.table("monthly_payments")
+        .upsert(records_to_insert, on_conflict="account_id,month")
+        .execute()
+    )
+    inserted_rows = res.data or []
+    if not inserted_rows:
+        raise HTTPException(status_code=500, detail="Upsert into monthly_payments returned no rows")
+
+    return [_serialize_payment_row(r, account_by_id) for r in inserted_rows]
+
+
+@app.patch("/api/payments/{payment_id}")
+def patch_payment(
+    payment_id: int,
+    payload: PaymentPatch,
+    _user: str = Depends(verify_bearer_token),
+):
+    _, account_by_id = _fetch_accounts()
+    updates: dict = {}
+
+    paid_val = payload.is_paid if payload.is_paid is not None else payload.paid
+    if paid_val is not None:
+        updates["is_paid"] = bool(paid_val)
+    if payload.amount is not None:
+        updates["amount"] = round(abs(float(payload.amount)), 2)
+    if payload.month is not None:
+        updates["month"] = validate_year_month(payload.month)
+    if payload.account_id is not None:
+        acct_id = int(payload.account_id)
+        if acct_id not in account_by_id:
+            raise HTTPException(status_code=404, detail=f"Account {acct_id} not found")
+        updates["account_id"] = acct_id
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields provided to update")
+
+    res = (
+        supabase.table("monthly_payments")
+        .update(updates)
+        .eq("id", payment_id)
+        .execute()
+    )
+    updated = (res.data or [None])[0]
+    if not updated:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    return _serialize_payment_row(updated, account_by_id)
+
+
+@app.delete("/api/payments/{payment_id}")
+def delete_payment(
+    payment_id: int,
+    _user: str = Depends(verify_bearer_token),
+):
+    res = (
+        supabase.table("monthly_payments")
+        .delete()
+        .eq("id", payment_id)
+        .execute()
+    )
+    deleted = (res.data or [None])[0]
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    return {"deleted": True, "id": payment_id}
