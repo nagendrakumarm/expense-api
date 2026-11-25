@@ -374,19 +374,26 @@ def get_category_comparison(
     else:
         end_date = f"{last_yr:04d}-{last_mo + 1:02d}-01"
 
-    cats_res = supabase.table("Categories").select("*").execute()
+    types_res = supabase.table("CategoryType").select("id, type").execute()
+    type_name_by_id: dict[int, str] = {
+        int(t["id"]): str(t.get("type") or "Expense").strip()
+        for t in (types_res.data or [])
+    }
+
+    cats_res = supabase.table("Categories").select("id, type, subtype").execute()
     categories_rows = cats_res.data or []
 
     cat_subtype_by_id: dict[int, str] = {}
     cat_type_by_id: dict[int, str] = {}
     for c in categories_rows:
         cid = int(c["id"])
+        type_id = int(c["type"]) if c.get("type") is not None else -1
         cat_subtype_by_id[cid] = str(c.get("subtype") or "Uncategorized").strip()
-        cat_type_by_id[cid] = str(c.get("categoryType") or c.get("type") or "Expense").strip()
+        cat_type_by_id[cid] = type_name_by_id.get(type_id, "Expense")
 
     tx_res = (
         supabase.table("Transactions")
-        .select("*")
+        .select("id, date, amount, category")
         .gte("date", start_date)
         .lt("date", end_date)
         .execute()
@@ -402,11 +409,11 @@ def get_category_comparison(
             continue
 
         cid = int(row.get("category") or 0)
-        cat_type = str(row.get("categoryType") or cat_type_by_id.get(cid) or "Expense").lower()
+        cat_type = cat_type_by_id.get(cid, "Expense").lower()
         if "income" in cat_type:
             continue
 
-        subtype = str(row.get("subtype") or cat_subtype_by_id.get(cid) or "Uncategorized").strip()
+        subtype = cat_subtype_by_id.get(cid, "Uncategorized")
         amount = abs(float(row.get("amount") or 0.0))
 
         expense_categories.add(subtype)
@@ -422,7 +429,6 @@ def get_category_comparison(
         "categories": sorted_categories,
         "totals_by_month": totals_by_month,
     }
-
 
 # --- Accounts & Monthly Payments ---
 
